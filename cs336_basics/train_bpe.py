@@ -11,7 +11,8 @@ def train_bpe(
     special_tokens: list[str]
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """
-    
+    Given a path to an input text file, trains a (byte-level) BPE tokenizer.
+
     Args: 
         input_path (str | os.PathLike): Path to a text file with BPE tokenizer training data.
         vocab_size (int): A positive integer that defines the maximum final vocabulary size (including the
@@ -37,18 +38,29 @@ def train_bpe(
         striped_content = strip_special_tokens(content, special_tokens)
 
         pre_tokens = [pre_tokenization(docs) for docs in striped_content]
-        pre_tokens = dict(sum((Counter(d) for d in pre_tokens), Counter())) #FIXME: sum these byte_pairs
+        # combine pre_tokens from different docs, sum their counts
+        pre_tokens = dict(sum((Counter(d) for d in pre_tokens), Counter()))
 
         while curr_size < vocab_size:
             pre_tokens, pair_to_merge = merge_once(pre_tokens)
 
-            vocab[len(vocab)] = b''.join(pair_to_merge)
+            vocab[len(vocab)] = b''.join(pair_to_merge) # b''.join(pair_to_merge) to merge tuple[bytes, bytes] to a bytes
             merges.append(pair_to_merge)
             curr_size += 1
 
     return vocab, merges
 
 def merge_once(pre_tokens: dict[tuple, int]) -> tuple[dict[tuple, int], tuple[bytes, bytes]]:
+    """
+    Compute byte pair from pre_tokens, and extract the most frequent one to merge, by lexicographical order.
+
+    Args:
+        pre_tokens (dict[tuple, int]): a mapping from pre_tokens to occurrence counts
+    
+    Returns:
+        pre_tokens (dict[tuple, int]): mapping that after merge a byte pair
+        pair_to_merge (tuple[bytes, bytes]): byte pair that need to merge this round
+    """
     byte_pair = {}
     for token, freq in pre_tokens.items():
         windows = zip(token, token[1:])
@@ -62,7 +74,17 @@ def merge_once(pre_tokens: dict[tuple, int]) -> tuple[dict[tuple, int], tuple[by
 
     return pre_tokens, pair_to_merge
 
-def merge_byte_pair(token: tuple[bytes, ...], pair: tuple[bytes, bytes]):
+def merge_byte_pair(token: tuple[bytes, ...], pair: tuple[bytes, bytes]) -> tuple[bytes, ...]:
+    """
+    Given the pair_to_merge, merge two neighbors if this pair is in token, otherwise stay same.
+
+    Args:
+        token (tuple[bytes, ...]): 
+        pair (tuple[bytes, bytes]):
+    
+    Returns: 
+        merged_tokens (tuple[bytes, ...]):
+    """
     merged_tokens = []
     i = 0
     while i < len(token):
@@ -75,12 +97,21 @@ def merge_byte_pair(token: tuple[bytes, ...], pair: tuple[bytes, bytes]):
     
     return tuple(merged_tokens)
 
-def pre_tokenization(text: str):
+def pre_tokenization(text: str) -> dict[tuple[bytes, ...], int]:
+    """
+    Pre-Tokenization by regex to shorten processing time to get byte pairs, and mitigate the impact of punctuation.
+
+    Args:
+        text (str): corpus
+
+    Returns:
+        pre_tokens (dict[tuple[bytes, ...], int]): mapping from pre_tokens to its occurrence counts
+    """
     PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
 
     pre_tokens = {}
     for match in re.finditer(PAT, text):
-        string_token = match.group()
+        string_token = match.group() # match is Match object, not str
         utf8_token = string_token.encode("utf-8")
         byte_token = tuple(bytes([b]) for b in utf8_token)
         pre_tokens[byte_token] = pre_tokens.get(byte_token, 0) + 1
@@ -88,6 +119,16 @@ def pre_tokenization(text: str):
     return pre_tokens
 
 def strip_special_tokens(chunk: str, special_tokens: list[str]) -> list[str]:
+    """
+    Strip the special tokens like <|endoftext|>, in case of cross document merge in byte pair.
+
+    Args:
+        chunk (str): corpus or chunk of corpus
+        special_tokens (list[str]): special tokens to strip
+
+    Returns: 
+        striped_chunk (list[str]): corpus that after stripping
+    """
     PAT = "|".join(special_tokens)
     striped_chunk = re.split(PAT, chunk)
 
