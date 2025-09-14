@@ -1,0 +1,148 @@
+import os
+import time
+import regex as re
+from typing import BinaryIO
+from collections import Counter
+
+
+def train_bpe(
+    input_path: str | os.PathLike, 
+    vocab_size: int, 
+    special_tokens: list[str]
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """
+    
+    Args: 
+        input_path (str | os.PathLike): Path to a text file with BPE tokenizer training data.
+        vocab_size (int): A positive integer that defines the maximum final vocabulary size (including the
+            initial byte vocabulary, vocabulary items produced from merging, and any special tokens)
+        special_tokens (list[str]): A list of strings to add to the vocabulary. These special tokens do not
+            otherwise affect BPE training.
+
+    Returns: 
+        vocab (dict[int, bytes]): The tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
+            to bytes (token bytes).
+        merges (list[tuple[bytes, bytes]]): A list of BPE merges produced from training. Each list item
+            is a tuple of bytes (<token1>, <token2>), representing that <token1> was merged with
+            <token2>. The merges should be ordered by order of creation.
+    """
+    # init vocab
+    vocab = {ids: bytes([ids]) for ids in range(256)} | \
+        {256 + ids: token.encode("utf-8") for ids, token in enumerate(special_tokens)}
+    curr_size = len(vocab)
+    merges = []
+
+    with open(input_path, "r", encoding="utf-8") as f:
+        content: str = f.read()
+        striped_content = strip_special_tokens(content, special_tokens)
+
+        pre_tokens = [pre_tokenization(docs) for docs in striped_content]
+        pre_tokens = dict(sum((Counter(d) for d in pre_tokens), Counter())) #FIXME: sum these byte_pairs
+
+        while curr_size < vocab_size:
+            pre_tokens, pair_to_merge = merge_once(pre_tokens)
+
+            vocab[len(vocab)] = b''.join(pair_to_merge)
+            merges.append(pair_to_merge)
+            curr_size += 1
+
+    return vocab, merges
+
+def merge_once(pre_tokens: dict[tuple, int]) -> tuple[dict[tuple, int], tuple[bytes, bytes]]:
+    byte_pair = {}
+    for token, freq in pre_tokens.items():
+        windows = zip(token, token[1:])
+        for window in windows:
+            byte_pair[window] = byte_pair.get(window, 0) + freq
+
+    max_val = max(byte_pair.values())
+    max_keys = [k for k, v in byte_pair.items() if v == max_val]
+    pair_to_merge = max(max_keys) # get lexicographically order greatest
+    pre_tokens = {merge_byte_pair(k, pair_to_merge): v for k, v in pre_tokens.items()}
+
+    return pre_tokens, pair_to_merge
+
+def merge_byte_pair(token: tuple[bytes, ...], pair: tuple[bytes, bytes]):
+    merged_tokens = []
+    i = 0
+    while i < len(token):
+        if i < len(token) - 1 and (token[i], token[i+1]) == pair:
+            merged_tokens.append(token[i] + token[i+1])
+            i += 2
+        else:
+            merged_tokens.append(token[i])
+            i += 1
+    
+    return tuple(merged_tokens)
+
+def pre_tokenization(text: str):
+    PAT = r"""'(?:[sdmt]|ll|ve|re)| ?\p{L}+| ?\p{N}+| ?[^\s\p{L}\p{N}]+|\s+(?!\S)|\s+"""
+
+    pre_tokens = {}
+    for match in re.finditer(PAT, text):
+        string_token = match.group()
+        utf8_token = string_token.encode("utf-8")
+        byte_token = tuple(bytes([b]) for b in utf8_token)
+        pre_tokens[byte_token] = pre_tokens.get(byte_token, 0) + 1
+    
+    return pre_tokens
+
+def strip_special_tokens(chunk: str, special_tokens: list[str]) -> list[str]:
+    PAT = "|".join(special_tokens)
+    striped_chunk = re.split(PAT, chunk)
+
+    return striped_chunk
+
+def find_chunk_boundaries(
+    file: BinaryIO,
+    desired_num_chunks: int,
+    split_special_token: bytes,
+) -> list[int]:
+    """
+    Chunk the file into parts that can be counted independently.
+    May return fewer chunks if the boundaries end up overlapping.
+    """
+    assert isinstance(split_special_token, bytes), "Must represent special token as a bytestring"
+
+    # Get total file size in bytes
+    file.seek(0, os.SEEK_END)
+    file_size = file.tell()
+    file.seek(0)
+
+    chunk_size = file_size // desired_num_chunks
+
+    # Initial guesses for chunk boundary locations, uniformly spaced
+    # Chunks start on previous index, don't include last index
+    chunk_boundaries = [i * chunk_size for i in range(desired_num_chunks + 1)]
+    chunk_boundaries[-1] = file_size
+
+    mini_chunk_size = 4096  # Read ahead by 4k bytes at a time
+
+    for bi in range(1, len(chunk_boundaries) - 1):
+        initial_position = chunk_boundaries[bi]
+        file.seek(initial_position)  # Start at boundary guess
+        while True:
+            mini_chunk = file.read(mini_chunk_size)  # Read a mini chunk
+
+            # If EOF, this boundary should be at the end of the file
+            if mini_chunk == b"":
+                chunk_boundaries[bi] = file_size
+                break
+
+            # Find the special token in the mini chunk
+            found_at = mini_chunk.find(split_special_token)
+            if found_at != -1:
+                chunk_boundaries[bi] = initial_position + found_at
+                break
+            initial_position += mini_chunk_size
+
+    # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
+    return sorted(set(chunk_boundaries))
+
+if __name__ == "__main__":
+    input_path = "/workspace/guozuyu/lmfs/assignment1-basics/tests/fixtures/corpus.en"
+
+    start_time = time.time()
+    vocab, merges = train_bpe(input_path=input_path, vocab_size=500, special_tokens=["<|endoftext|>"])
+    end_time = time.time()
+    print(end_time - start_time)
