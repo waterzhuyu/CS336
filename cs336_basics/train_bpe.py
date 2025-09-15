@@ -1,9 +1,20 @@
 import os
 import time
+import multiprocessing
 import regex as re
 from typing import BinaryIO
-from collections import Counter
+from collections import Counter, defaultdict
 
+def process_chunk_worker(args):
+    input_path, start, end, special_tokens = args
+    with open(input_path, "rb") as f:
+        f.seek(start)
+        chunk = f.read(end - start).decode("utf-8", errors="ignore")
+        striped_chunk = strip_special_tokens(chunk, special_tokens)
+        pre_tokens = [pre_tokenization(docs) for docs in striped_chunk]
+
+        pre_tokens = dict(sum((Counter(d) for d in pre_tokens), Counter()))
+    return pre_tokens
 
 def train_bpe(
     input_path: str | os.PathLike, 
@@ -50,6 +61,107 @@ def train_bpe(
 
     return vocab, merges
 
+def optimized_train_bpe(
+    input_path: str | os.PathLike, 
+    vocab_size: int, 
+    special_tokens: list[str]
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """
+    Given a path to an input text file, trains a (byte-level) BPE tokenizer.
+
+    API change, from `merge_once` to `optimized_merge`, which update `pre_tokens`, `byte_pairs` and `byte_pair_positions` in place,
+    and using incremental update.
+
+    Args: 
+        input_path (str | os.PathLike): Path to a text file with BPE tokenizer training data.
+        vocab_size (int): A positive integer that defines the maximum final vocabulary size (including the
+            initial byte vocabulary, vocabulary items produced from merging, and any special tokens)
+        special_tokens (list[str]): A list of strings to add to the vocabulary. These special tokens do not
+            otherwise affect BPE training.
+
+    Returns: 
+        vocab (dict[int, bytes]): The tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
+            to bytes (token bytes).
+        merges (list[tuple[bytes, bytes]]): A list of BPE merges produced from training. Each list item
+            is a tuple of bytes (<token1>, <token2>), representing that <token1> was merged with
+            <token2>. The merges should be ordered by order of creation.
+    """
+    # init vocab
+    vocab = {ids: bytes([ids]) for ids in range(256)} | \
+        {256 + ids: token.encode("utf-8") for ids, token in enumerate(special_tokens)}
+    curr_size = len(vocab)
+    merges = []
+
+    with open(input_path, "r", encoding="utf-8") as f:
+        content: str = f.read()
+        striped_content = strip_special_tokens(content, special_tokens)
+
+        pre_tokens = [pre_tokenization(docs) for docs in striped_content]
+        # combine pre_tokens from different docs, sum their counts
+        pre_tokens = dict(sum((Counter(d) for d in pre_tokens), Counter()))
+
+        byte_pairs, byte_pair_positions = init_byte_pair(pre_tokens)
+        while curr_size < vocab_size:
+            pre_tokens, pair_to_merge, byte_pairs, byte_pair_positions = optimized_merge(pre_tokens, byte_pairs, byte_pair_positions)
+
+            vocab[len(vocab)] = b''.join(pair_to_merge) # b''.join(pair_to_merge) to merge tuple[bytes, bytes] to a bytes
+            merges.append(pair_to_merge)
+            curr_size += 1
+
+    return vocab, merges
+
+def optimized_train_bpe_parallel(
+    input_path: str | os.PathLike, 
+    vocab_size: int, 
+    special_tokens: list[str]
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """
+    Given a path to an input text file, trains a (byte-level) BPE tokenizer.
+
+    Parallalize the process of pre-tokenzition.
+
+    Args: 
+        input_path (str | os.PathLike): Path to a text file with BPE tokenizer training data.
+        vocab_size (int): A positive integer that defines the maximum final vocabulary size (including the
+            initial byte vocabulary, vocabulary items produced from merging, and any special tokens)
+        special_tokens (list[str]): A list of strings to add to the vocabulary. These special tokens do not
+            otherwise affect BPE training.
+
+    Returns: 
+        vocab (dict[int, bytes]): The tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
+            to bytes (token bytes).
+        merges (list[tuple[bytes, bytes]]): A list of BPE merges produced from training. Each list item
+            is a tuple of bytes (<token1>, <token2>), representing that <token1> was merged with
+            <token2>. The merges should be ordered by order of creation.
+    """
+    # init vocab
+    vocab = {ids: bytes([ids]) for ids in range(256)} | \
+        {256 + ids: token.encode("utf-8") for ids, token in enumerate(special_tokens)}
+    curr_size = len(vocab)
+    merges = []
+
+    with open(input_path, "rb") as f:
+        num_processes = 4
+        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+
+    tasks = [(input_path, start, end, special_tokens) for start, end in zip(boundaries[:-1], boundaries[1:])]
+    with multiprocessing.Pool(num_processes) as pool:
+        results = pool.map(process_chunk_worker, tasks)
+    
+    pre_tokens = Counter()
+    for r in results:
+        pre_tokens.update(r)
+
+    byte_pairs, byte_pair_positions = init_byte_pair(pre_tokens)
+    while curr_size < vocab_size:
+        pre_tokens, pair_to_merge, byte_pairs, byte_pair_positions = optimized_merge(pre_tokens, byte_pairs, byte_pair_positions)
+
+        vocab[len(vocab)] = b''.join(pair_to_merge) # b''.join(pair_to_merge) to merge tuple[bytes, bytes] to a bytes
+        merges.append(pair_to_merge)
+        curr_size += 1
+
+    return vocab, merges
+
 def merge_once(pre_tokens: dict[tuple, int]) -> tuple[dict[tuple, int], tuple[bytes, bytes]]:
     """
     Compute byte pair from pre_tokens, and extract the most frequent one to merge, by lexicographical order.
@@ -68,12 +180,67 @@ def merge_once(pre_tokens: dict[tuple, int]) -> tuple[dict[tuple, int], tuple[by
             byte_pair[window] = byte_pair.get(window, 0) + freq
 
     max_val = max(byte_pair.values())
-    max_keys = [k for k, v in byte_pair.items() if v == max_val]
-    pair_to_merge = max(max_keys) # get lexicographically order greatest
+    pair_to_merge = max([k for k, v in byte_pair.items() if v == max_val])
     pre_tokens = {merge_byte_pair(k, pair_to_merge): v for k, v in pre_tokens.items()}
 
     return pre_tokens, pair_to_merge
 
+def init_byte_pair(pre_tokens: dict[tuple, int]) -> tuple[dict[tuple[bytes, bytes], int], dict[tuple[bytes, bytes], list]]:
+    """
+    Initialize the `byte_pairs` and `byte_pair_positions` from `pre_tokens`
+
+    Args:
+        pre_tokens: mapping from pre_tokens to its occurrence counts
+    
+    Returns:
+        byte_pairs: byte pairs
+        byte_pair_positions: mapping from byte pair to the pre-tokens which it occurs.
+    """
+    byte_pair = defaultdict(int)
+    byte_pair_postions = defaultdict(list)
+
+    for token, freq in pre_tokens.items():
+        windows = zip(token, token[1:])
+        for window in windows:
+            byte_pair[window] += freq
+            byte_pair_postions[window].append(token)
+    
+    return byte_pair, byte_pair_postions
+
+def optimized_merge(
+        pre_tokens: dict[tuple, int], 
+        byte_pairs: dict[tuple[bytes, bytes], int], 
+        byte_pair_positions: dict[tuple[bytes, bytes], list]
+        ) -> tuple[dict[tuple, int], tuple[bytes, bytes], dict[tuple[bytes, bytes], int], dict[tuple[bytes, bytes], list]]:
+    """
+    Optimized the merging process by incremental updating and in-place update.
+    API change from merge_once, which not maintain the `byte_pairs` and `byte_pair_positions` and create from scratch every time.
+    """
+    max_val = max(byte_pairs.values())
+    pair_to_merge = max([k for k, v in byte_pairs.items() if v == max_val])
+    positions = set(byte_pair_positions[pair_to_merge])
+
+    for token in list(positions):
+        freq = pre_tokens.pop(token, 0)
+        if freq == 0:
+            continue
+
+        merged_token = merge_byte_pair(token, pair_to_merge)
+        # pre_tokens[merged_token] += freq
+        pre_tokens[merged_token] = pre_tokens.get(merged_token, 0) + freq
+
+        for w in zip(token, token[1:]):
+            byte_pairs[w] -= freq
+            if byte_pairs[w] <= 0:
+                del byte_pairs[w]
+            byte_pair_positions[w].remove(token)
+        
+        for w in zip(merged_token, merged_token[1:]):
+            byte_pairs[w] += freq
+            byte_pair_positions[w].append(merged_token)
+    
+    return pre_tokens, pair_to_merge, byte_pairs, byte_pair_positions
+            
 def merge_byte_pair(token: tuple[bytes, ...], pair: tuple[bytes, bytes]) -> tuple[bytes, ...]:
     """
     Given the pair_to_merge, merge two neighbors if this pair is in token, otherwise stay same.
@@ -112,8 +279,7 @@ def pre_tokenization(text: str) -> dict[tuple[bytes, ...], int]:
     pre_tokens = {}
     for match in re.finditer(PAT, text):
         string_token = match.group() # match is Match object, not str
-        utf8_token = string_token.encode("utf-8")
-        byte_token = tuple(bytes([b]) for b in utf8_token)
+        byte_token = tuple(bytes([b]) for b in string_token.encode("utf-8"))
         pre_tokens[byte_token] = pre_tokens.get(byte_token, 0) + 1
     
     return pre_tokens
@@ -184,6 +350,6 @@ if __name__ == "__main__":
     input_path = "/workspace/guozuyu/lmfs/assignment1-basics/tests/fixtures/corpus.en"
 
     start_time = time.time()
-    vocab, merges = train_bpe(input_path=input_path, vocab_size=500, special_tokens=["<|endoftext|>"])
+    vocab, merges = optimized_train_bpe(input_path=input_path, vocab_size=500, special_tokens=["<|endoftext|>"])
     end_time = time.time()
     print(end_time - start_time)
