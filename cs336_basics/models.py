@@ -63,7 +63,7 @@ class RMSNorm(nn.Module):
 
         # init to 1
         g = torch.ones(d_model, device=device, dtype=dtype)
-        self.param = nn.Parameter(g)
+        self.weight = nn.Parameter(g)
     
     def forward(self, x: Float[Tensor, "batch seq d_model"]) -> Float[Tensor, "batch seq d_model"]:
         in_dtype = x.dtype
@@ -73,7 +73,7 @@ class RMSNorm(nn.Module):
 
         # Compute Root-Mean-Square along the last dimension.
         rms = torch.sqrt(torch.mean(x ** 2, dim=-1, keepdim=True) + self.eps)
-        result = x * self.param / rms
+        result = x * self.weight / rms
 
         return result.to(in_dtype)
 
