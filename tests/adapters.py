@@ -8,9 +8,11 @@ import numpy.typing as npt
 import torch
 from jaxtyping import Bool, Float, Int
 from torch import Tensor
+from einops import rearrange
 
 from cs336_basics.train_bpe import optimized_train_bpe, optimized_train_bpe_parallel
 from cs336_basics.tokenizer import Tokenizer
+from cs336_basics.models import swish, softmax, scaled_dot_product_attention, Linear, Embedding, RMSNorm, PositionWiseFFN, RotaryPositionalEmbedding, CausalMultiHeadAttention
 
 def run_linear(
     d_in: int,
@@ -30,9 +32,11 @@ def run_linear(
     Returns:
         Float[Tensor, "... d_out"]: The transformed output of your linear module.
     """
+    model = Linear(in_features=d_in, out_features=d_out)
+    state_dict = {'weight': rearrange(weights, " d_out d_in -> d_in d_out")}
+    model.load_state_dict(state_dict)
 
-    raise NotImplementedError
-
+    return model(in_features)
 
 def run_embedding(
     vocab_size: int,
@@ -52,9 +56,11 @@ def run_embedding(
     Returns:
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
+    model = Embedding(vocab_size, d_model)
+    state_dict = {'param': weights}
+    model.load_state_dict(state_dict)
 
-    raise NotImplementedError
-
+    return model(token_ids)
 
 def run_swiglu(
     d_model: int,
@@ -85,7 +91,15 @@ def run_swiglu(
     # swiglu.w1.weight.data = w1_weight
     # swiglu.w2.weight.data = w2_weight
     # swiglu.w3.weight.data = w3_weight
-    raise NotImplementedError
+    model = PositionWiseFFN(d_model, d_ff)
+    state_dict = {
+        'w1.weight': rearrange(w1_weight, " d_ff d_model -> d_model d_ff"),
+        'w2.weight': rearrange(w2_weight, " d_model d_ff -> d_ff d_model"),
+        'w3.weight': rearrange(w3_weight, "d_ff d_model -> d_model d_ff"),
+    }
+    model.load_state_dict(state_dict)
+    
+    return model(in_features)
 
 
 def run_scaled_dot_product_attention(
@@ -106,8 +120,7 @@ def run_scaled_dot_product_attention(
     Returns:
         Float[Tensor, " ... queries d_v"]: Output of SDPA
     """
-    raise NotImplementedError
-
+    return scaled_dot_product_attention(Q, K, V, mask)
 
 def run_multihead_self_attention(
     d_model: int,
@@ -140,7 +153,16 @@ def run_multihead_self_attention(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    model = CausalMultiHeadAttention(d_model, num_heads, use_rope=False)
+    state_dict = {
+        'q_proj.weight': rearrange(q_proj_weight, "d_k d_in -> d_in d_k"),
+        'k_proj.weight': rearrange(k_proj_weight, "d_k d_in -> d_in d_k"),
+        'v_proj.weight': rearrange(v_proj_weight, "d_v d_in -> d_in d_v"),
+        'output_proj.weight': rearrange(o_proj_weight, "d_model d_v -> d_v d_model")
+    }
+    model.load_state_dict(state_dict)
+
+    return model(in_features)
 
 
 def run_multihead_self_attention_with_rope(
@@ -180,8 +202,21 @@ def run_multihead_self_attention_with_rope(
         Float[Tensor, " ... sequence_length d_out"]: Tensor with the output of running your optimized, batched multi-headed attention
         implementation with the given QKV projection weights and input features.
     """
-    raise NotImplementedError
+    model = CausalMultiHeadAttention(d_model, num_heads, use_rope=True, theta=theta, max_seq_len=max_seq_len)
+    # lack `pe.cos_term` and `pe.sin_term`, don't match state_dict
+    # state_dict = {
+    #     'q_proj.weight': rearrange(q_proj_weight, "d_k d_in -> d_in d_k"),
+    #     'k_proj.weight': rearrange(k_proj_weight, "d_k d_in -> d_in d_k"),
+    #     'v_proj.weight': rearrange(v_proj_weight, "d_v d_in -> d_in d_v"),
+    #     'output_proj.weight': rearrange(o_proj_weight, "d_model d_v -> d_v d_model")
+    # }
+    # model.load_state_dict(state_dict)
+    model.q_proj.weight.data = rearrange(q_proj_weight, "d_k d_in -> d_in d_k")
+    model.k_proj.weight.data = rearrange(k_proj_weight, "d_k d_in -> d_in d_k")
+    model.v_proj.weight.data = rearrange(v_proj_weight, "d_v d_in -> d_in d_v")
+    model.output_proj.weight.data = rearrange(o_proj_weight, "d_model d_v -> d_v d_model")
 
+    return model(in_features, token_positions)
 
 def run_rope(
     d_k: int,
@@ -202,7 +237,9 @@ def run_rope(
     Returns:
         Float[Tensor, " ... sequence_length d_k"]: Tensor with RoPEd input.
     """
-    raise NotImplementedError
+    model = RotaryPositionalEmbedding(theta=theta, d_k=d_k, max_seq_len=max_seq_len)
+
+    return model(in_query_or_key, token_positions)
 
 
 def run_transformer_block(
@@ -380,7 +417,11 @@ def run_rmsnorm(
         Float[Tensor,"... d_model"]: Tensor of with the same shape as `in_features` with the output of running
         RMSNorm of the `in_features`.
     """
-    raise NotImplementedError
+    model = RMSNorm(d_model, eps=eps)
+    state_dict = {'param': weights}
+    model.load_state_dict(state_dict)
+
+    return model(in_features)
 
 
 def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
@@ -394,8 +435,7 @@ def run_silu(in_features: Float[Tensor, " ..."]) -> Float[Tensor, " ..."]:
         Float[Tensor,"..."]: of with the same shape as `in_features` with the output of applying
         SiLU to each element.
     """
-    raise NotImplementedError
-
+    return swish(in_features)
 
 def run_get_batch(
     dataset: npt.NDArray, batch_size: int, context_length: int, device: str
@@ -433,8 +473,7 @@ def run_softmax(in_features: Float[Tensor, " ..."], dim: int) -> Float[Tensor, "
         Float[Tensor, "..."]: Tensor of with the same shape as `in_features` with the output of
         softmax normalizing the specified `dim`.
     """
-    raise NotImplementedError
-
+    return softmax(in_features, dim=dim)
 
 def run_cross_entropy(
     inputs: Float[Tensor, " batch_size vocab_size"], targets: Int[Tensor, " batch_size"]
