@@ -12,7 +12,7 @@ from einops import rearrange
 
 from cs336_basics.train_bpe import optimized_train_bpe, optimized_train_bpe_parallel
 from cs336_basics.tokenizer import Tokenizer
-from cs336_basics.models import swish, softmax, scaled_dot_product_attention, Linear, Embedding, RMSNorm, PositionWiseFFN, RotaryPositionalEmbedding, CausalMultiHeadAttention
+from cs336_basics.models import swish, softmax, scaled_dot_product_attention, Linear, Embedding, RMSNorm, PositionWiseFFN, RotaryPositionalEmbedding, CausalMultiHeadAttention, TransformerBlock, TransformerLM
 
 def run_linear(
     d_in: int,
@@ -57,7 +57,7 @@ def run_embedding(
         Float[Tensor, "... d_model"]: Batch of embeddings returned by your Embedding layer.
     """
     model = Embedding(vocab_size, d_model)
-    state_dict = {'param': weights}
+    state_dict = {'weight': weights}
     model.load_state_dict(state_dict)
 
     return model(token_ids)
@@ -312,8 +312,25 @@ def run_transformer_block(
         Float[Tensor, "batch sequence_length d_model"] Tensor with the output of
         running the Transformer block on the input features while using RoPE.
     """
-    raise NotImplementedError
+    model = TransformerBlock(
+        d_model=d_model, 
+        num_heads=num_heads, 
+        d_ff=d_ff, 
+        use_rope=True, 
+        theta=theta, 
+        max_seq_len=max_seq_len
+        )
+    model.attn.q_proj.weight.data = weights['attn.q_proj.weight'].transpose(0, 1)
+    model.attn.k_proj.weight.data = weights['attn.k_proj.weight'].transpose(0, 1)
+    model.attn.v_proj.weight.data = weights['attn.v_proj.weight'].transpose(0, 1)
+    model.attn.output_proj.weight.data = weights['attn.output_proj.weight'].transpose(0, 1)
+    model.ln1.weight.data = weights['ln1.weight']
+    model.ffn.w1.weight.data = weights['ffn.w1.weight'].transpose(0, 1)
+    model.ffn.w2.weight.data = weights['ffn.w2.weight'].transpose(0, 1)
+    model.ffn.w3.weight.data = weights['ffn.w3.weight'].transpose(0, 1)
+    model.ln2.weight.data = weights['ln2.weight']
 
+    return model(in_features)
 
 def run_transformer_lm(
     vocab_size: int,
@@ -394,8 +411,30 @@ def run_transformer_lm(
         Float[Tensor, "batch_size sequence_length vocab_size"]: Tensor with the predicted unnormalized
         next-word distribution for each token.
     """
-    raise NotImplementedError
+    model = TransformerLM(
+        vocab_size=vocab_size, 
+        context_length=context_length, 
+        num_layers=num_layers, 
+        d_model=d_model, 
+        num_heads=num_heads, 
+        d_ff=d_ff, 
+        rope_theta=rope_theta
+        )
+    model.token_embeddings.weight.data = weights['token_embeddings.weight']
+    for i in range(num_layers):
+        model.layers[i].attn.q_proj.weight.data = weights[f'layers.{i}.attn.q_proj.weight'].transpose(0, 1)
+        model.layers[i].attn.k_proj.weight.data = weights[f'layers.{i}.attn.k_proj.weight'].transpose(0, 1)
+        model.layers[i].attn.v_proj.weight.data = weights[f'layers.{i}.attn.v_proj.weight'].transpose(0, 1)
+        model.layers[i].attn.output_proj.weight.data = weights[f'layers.{i}.attn.output_proj.weight'].transpose(0, 1)
+        model.layers[i].ln1.weight.data = weights[f'layers.{i}.ln1.weight']
+        model.layers[i].ffn.w1.weight.data = weights[f'layers.{i}.ffn.w1.weight'].transpose(0, 1)
+        model.layers[i].ffn.w2.weight.data = weights[f'layers.{i}.ffn.w2.weight'].transpose(0, 1)
+        model.layers[i].ffn.w3.weight.data = weights[f'layers.{i}.ffn.w3.weight'].transpose(0, 1)
+        model.layers[i].ln2.weight.data = weights[f'layers.{i}.ln2.weight']
+    model.ln_final.weight.data = weights['ln_final.weight']
+    model.lm_head.weight.data = weights['lm_head.weight'].transpose(0, 1)
 
+    return model(in_indices)
 
 def run_rmsnorm(
     d_model: int,

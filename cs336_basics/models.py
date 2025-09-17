@@ -44,10 +44,10 @@ class Embedding(nn.Module):
         # init to \mathcal{N}(0, 1), truncate to (-3, 3)
         nn.init.trunc_normal_(p, mean=0, std=1, a=-3, b=-3)
 
-        self.param = nn.Parameter(p)
+        self.weight = nn.Parameter(p)
     
     def forward(self, x: Float[Tensor, "batch seq"]) -> Float[Tensor, "batch seq d_model"]:
-        return self.param[x]
+        return self.weight[x]
 
 class RMSNorm(nn.Module):
     def __init__(
@@ -190,7 +190,7 @@ class CausalMultiHeadAttention(nn.Module):
             self, 
             d_model: int, 
             num_heads: int, 
-            use_rope=False, 
+            use_rope: bool = False, 
             theta: float | None = None, 
             max_seq_len: int | None = None
         ) -> None:
@@ -244,9 +244,83 @@ class CausalMultiHeadAttention(nn.Module):
         return self.output_proj(result)
 
 class TransformerBlock(nn.Module):
-    def __init__(self, *args, **kwargs) -> None:
-        super().__init__(*args, **kwargs)
-    
-    def forward(self, x):
-        pass
+    def __init__(
+            self,
+            d_model: int,
+            num_heads: int,
+            d_ff: int, 
+            use_rope: bool = False,
+            theta: float | None = None,
+            max_seq_len: int | None = None
+        ) -> None:
+        super().__init__()
 
+        self.attn = CausalMultiHeadAttention(
+            d_model=d_model, 
+            num_heads=num_heads, 
+            use_rope=use_rope, 
+            theta=theta, 
+            max_seq_len=max_seq_len
+        )
+
+        self.ln1 = RMSNorm(d_model=d_model)
+
+        self.ffn = PositionWiseFFN(d_model=d_model, d_ff=d_ff)
+
+        self.ln2 = RMSNorm(d_model=d_model)
+    
+    def forward(
+            self, 
+            x: Float[Tensor, "batch seq d_model"],
+            token_positions: Float[Tensor, "... seq"] | None = None
+        ) -> Float[Tensor, "batch seq d_model"]:
+        b, s, d = x.shape
+        # self attn sublayer
+        if self.attn.use_rope:
+            if token_positions is None:
+                token_positions = torch.arange(0, s)
+            x = x + self.attn(self.ln1(x), token_positions=token_positions)
+        else:
+            x = x + self.attn(self.ln1(x))
+        # ffn sublayer
+        x = x + self.ffn(self.ln2(x))
+
+        return x
+
+class TransformerLM(nn.Module):
+    def __init__(
+            self, 
+            vocab_size: int,
+            context_length: int,
+            num_layers: int,
+            d_model: int,
+            num_heads: int,
+            d_ff: int,
+            rope_theta: float
+        ) -> None:
+        super().__init__()
+
+        self.token_embeddings = Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
+        self.layers = [
+            TransformerBlock(
+                d_model=d_model, 
+                num_heads=num_heads, 
+                d_ff=d_ff,
+                use_rope=True,
+                theta=rope_theta,
+                max_seq_len=context_length
+            ) 
+            for _ in range(num_layers)
+        ]
+        self.ln_final = RMSNorm(d_model=d_model)
+        self.lm_head = Linear(in_features=d_model, out_features=vocab_size)
+
+    def forward(self, x: Float[Tensor, "batch seq"]) -> Float[Tensor, "batch seq vocab_size"]:
+        # word embedding
+        x = self.token_embeddings(x)
+        # transformer blocks
+        for layer in self.layers:
+            x = layer(x)
+        x = self.ln_final(x)
+
+        return self.lm_head(x)
