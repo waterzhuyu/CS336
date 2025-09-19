@@ -49,10 +49,12 @@ class Tokenizer:
 
         return cls(vocab, merges, special_tokens)
 
-    def to_files(self, vocab_filepath: str, merges_filepath: str):
+    def to_files(self, output_path: str):
         """
         Serialize vocab and merges to disk in the given file path
         """
+        vocab_filepath = f"{output_path}/vocab.json"
+        merges_filepath = f"{output_path}/merges.json"
         with open(vocab_filepath, "w", encoding="utf-8") as f:
             vocab = {k: v.decode("utf-8", errors="replace") for k, v in self.vocab.items()}
             json.dump(vocab, f, ensure_ascii=False, indent=2)
@@ -253,7 +255,7 @@ if __name__ == "__main__":
     ids = tokenizer.encode("the cat ate <|endoftext|><|endoftext|>")
     decoded_str = tokenizer.decode(ids)
 
-    tokenizer.to_files("results/vocab.json", "results/merges.json")
+    tokenizer.to_files("results")
 
     a = Tokenizer.from_files("results/vocab.json", "results/merges.json")
 
