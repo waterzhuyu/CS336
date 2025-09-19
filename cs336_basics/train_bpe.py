@@ -113,7 +113,8 @@ def optimized_train_bpe(
 def optimized_train_bpe_parallel(
     input_path: str | os.PathLike, 
     vocab_size: int, 
-    special_tokens: list[str]
+    special_tokens: list[str], 
+    num_processes: int = 4,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """
     Given a path to an input text file, trains a (byte-level) BPE tokenizer.
@@ -141,7 +142,6 @@ def optimized_train_bpe_parallel(
     merges = []
 
     with open(input_path, "rb") as f:
-        num_processes = 4
         boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
 
     tasks = [(input_path, start, end, special_tokens) for start, end in zip(boundaries[:-1], boundaries[1:])]
