@@ -1,7 +1,16 @@
+import os
 import json
+import base64
+import time
+import heapq
 
 import regex as re
+
+import numpy as np
+
 from typing import Iterable, Iterator
+from itertools import islice
+from concurrent.futures import ThreadPoolExecutor
 
 class Tokenizer:
     def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
@@ -30,6 +39,8 @@ class Tokenizer:
         
         self.reverse_vocab = {v: k for k, v in self.vocab.items()}
 
+        self.merge_priority = {pair: i for i, pair in enumerate(self.merges)}
+
     @classmethod
     def from_files(cls, vocab_filepath: str, merges_filepath: str, special_tokens: list[str] | None = None):
         """
@@ -39,29 +50,34 @@ class Tokenizer:
         """
         with open(vocab_filepath, "r", encoding="utf-8") as f:
             vocab = json.load(f)
-        vocab = {k: v.encode("utf-8") for k, v in vocab.items()}
+        vocab = {int(k): base64.b64decode(v) for k, v in vocab.items()}
 
         merges = []
         with open(merges_filepath, "r", encoding="utf-8") as f:
-            line = f.readline()
-            a, b = json.loads(line)
-            merges.append((a.encode("utf-8"), b.encode("utf-8")))
+            for line in f:
+                a, b = json.loads(line)
+                merges.append((base64.b64decode(a), base64.b64decode(b)))
 
         return cls(vocab, merges, special_tokens)
 
     def to_files(self, output_path: str):
         """
         Serialize vocab and merges to disk in the given file path
+        Using Base64 encoding, not utf-8 in case of invalid unicode
         """
-        vocab_filepath = f"{output_path}/vocab.json"
-        merges_filepath = f"{output_path}/merges.json"
+        os.makedirs(output_path, exist_ok=True)
+
+        vocab_filepath = os.path.join(output_path, "vocab.json")
+        merges_filepath = os.path.join(output_path, "merges.json")
+
         with open(vocab_filepath, "w", encoding="utf-8") as f:
-            vocab = {k: v.decode("utf-8", errors="replace") for k, v in self.vocab.items()}
+            vocab = {k: base64.b64encode(v).decode("utf-8") for k, v in self.vocab.items()}
+            # When json.dump, automatically convert key from int to str, 'cause key must be str
             json.dump(vocab, f, ensure_ascii=False, indent=2)
 
         with open(merges_filepath, "w", encoding="utf-8") as f:
-            for a, b in merges:
-                f.write(json.dumps([a.decode("utf-8"), b.decode("utf-8")], ensure_ascii=False) + "\n")
+            for a, b in self.merges:
+                f.write(json.dumps([base64.b64encode(a).decode("utf-8"), base64.b64encode(b).decode("utf-8")], ensure_ascii=False) + "\n")
     
     @staticmethod
     def pre_tokenization(text: str) -> list[tuple[bytes, ...]]:
@@ -106,6 +122,30 @@ class Tokenizer:
                 merged_tokens.append(token[i])
                 i += 1
         
+        return tuple(merged_tokens)
+
+    @staticmethod
+    def merge_at_idx(token: tuple[bytes, ...], idx: int) -> tuple[bytes, ...]:
+        """
+        Given the pair_to_merge, merge two neighbors if this pair is in token, otherwise stay same.
+
+        Args:
+            token (tuple[bytes, ...]): 
+            pair (tuple[bytes, bytes]):
+        
+        Returns: 
+            merged_tokens (tuple[bytes, ...]):
+        """
+        merged_tokens = []
+        i = 0
+        while i < len(token):
+            if i == idx:
+                merged_tokens.append(token[i] + token[i+1])
+                i += 2
+            else:
+                merged_tokens.append(token[i])
+                i += 1
+
         return tuple(merged_tokens)
 
     def split_special_tokens(self, text, special_tokens):
@@ -165,7 +205,7 @@ class Tokenizer:
     #         target_ids.extend([self.reverse_vocab[t] for t in token])
     #     return target_ids
 
-    def encode(self, text: str) -> list[int]:
+    def deoptimized_encode(self, text: str) -> list[int]:
         """
         Encode an input text into a sequence of token IDs.
 
@@ -229,34 +269,126 @@ class Tokenizer:
                 target_ids.extend([self.reverse_vocab[t] for t in token])
         
         return target_ids
+    
+    def encode(self, text: str):
+        """Maintain a priority-heap."""
+        chunks = self.split_special_tokens(text, self.special_tokens)
 
-    def encode_iterable(self, iterable: Iterable[str]) -> Iterator[int]:
+        pre_tokens = []
+        for chunk in chunks:
+            if chunk in self.special_tokens:
+                pre_tokens.extend([chunk])
+            else:
+                pre_tokens.extend(Tokenizer.pre_tokenization(chunk))
+
+        target_ids = []
+        # Construct heap
+        heap = []
+        for token in pre_tokens: # mutate when iterating, token is immutable
+
+            if token in self.special_tokens:
+                target_ids.append(self.reverse_vocab[token.encode("utf-8")])
+            else:
+                for i in range(len(token) - 1):
+                    pair = (token[i], token[i+1])
+                    if pair in self.merge_priority:
+                        heapq.heappush(heap, (self.merge_priority[pair], i, pair))
+
+                while heap:
+                    if len(token) == 1:
+                        # only  1 token now, don't need to iterate heap, all its content is outdated.
+                        break
+
+                    _, i, pair = heapq.heappop(heap)
+                    # lazy deletion: detect this heap pair if outdated
+                    # 'H' 'e' 'l' 'l' 'o', if merge 'H' 'e' first time, then (3, ('l', 'o')) need to update idx
+                    if i >= len(token) - 1:
+                        continue
+                    if (token[i], token[i+1]) != pair:
+                        continue
+
+                    token = Tokenizer.merge_at_idx(token, i)
+
+                    if i > 0:
+                        # don't need to update its all left pair
+                        left_pair = (token[i-1], token[i])
+                        if left_pair in self.merge_priority:
+                            heapq.heappush(heap, (self.merge_priority[left_pair], i - 1, left_pair))
+
+                    while i < len(token) - 1:
+                        # need to update all its right pair, because need to update its index
+                        right_pair = (token[i], token[i+1])
+                        if right_pair in self.merge_priority:
+                            heapq.heappush(heap, (self.merge_priority[right_pair], i, right_pair))
+                        i += 1
+
+                target_ids.extend([self.reverse_vocab[t] for t in token])
+
+        return target_ids
+
+    def encode_iterable(self, iterable: Iterable[str], batch_size: int = 256, num_workers = 8) -> Iterator[int]:
         """
         Given an iterable of strings (e.g., a Python file handle), return a generator that lazily yields token IDs. 
         This is required for memory-efficient tokenization of large files that we cannot directly load into
         memory.
+
+        Using ThreadPoolExecutor to parallelize the encoding of one batch.
         """
-        for elem in iterable:
-            yield from self.encode(elem)
+        with ThreadPoolExecutor(max_workers=num_workers) as executor:
+            # i = 1
+            # start = time.time()
+            for batch in batched(iterable, batch_size):
+                results = list(executor.map(self.encode, batch)) # return as submit order
+                for encoded in results:
+                    yield from encoded
+                # end = time.time()
+                # print(f"{i} batch yield: ", end - start)
+                # i += 1
+
+    def encode_shard(self, shard_id, lines, out_dir, batch_size, num_workers):
+        """encode batch and write to numpy file"""
+        buffer = []
+        shard_path = os.path.join(out_dir, f"shard_{shard_id:05d}.npy")
+
+        with ThreadPoolExecutor(num_workers) as executor:
+            for batch in batched(lines, batch_size):
+                results = list(executor.map(self.encode, batch))
+                buffer.extend(results)
+
+        np.save(shard_path, np.array(buffer, dtype=object))
+        print(f"[Shard {shard_id}] Saved {len(buffer)} samples -> {shard_path}")
+        
+        return shard_path, len(buffer)
 
     def decode(self, ids: list[int]) -> str:
         """Decode a sequence of token IDs into text."""
         tokens = [self.vocab[i] for i in ids]
         return b''.join(tokens).decode("utf-8", errors="replace")
 
+def batched(iterable, n, *, strict=False):
+    # batched('ABCDEFG', 2) → AB CD EF G
+    if n < 1:
+        raise ValueError('n must be at least one')
+    iterator = iter(iterable)
+    while batch := tuple(islice(iterator, n)):
+        if strict and len(batch) != n:
+            raise ValueError('batched(): incomplete batch')
+        yield batch
+
 
 if __name__ == "__main__":
-    vocab = {0: b' ', 1: b'a', 2: b'c', 3: b'e', 4: b'h', 5: b't', 6: b'th', 7: b' c', 8: b' a', 9: b'the', 10: b' at', 11: b'<|endoftext|>'}
-    merges = [(b't', b'h'), (b' ', b'c'), (b' ', b'a'), (b'th', b'e'), (b' a', b't')]
-    special_tokens = ["<|endoftext|>"]
-    PAT = "|".join(map(re.escape, special_tokens))
-    chunks = re.split(f"({PAT})", "the cat ate <|endoftext|><|endoftext|>")
-    tokenizer = Tokenizer(vocab, merges)
-    ids = tokenizer.encode("the cat ate <|endoftext|><|endoftext|>")
-    decoded_str = tokenizer.decode(ids)
+    # vocab = {0: b' ', 1: b'a', 2: b'c', 3: b'e', 4: b'h', 5: b't', 6: b'th', 7: b' c', 8: b' a', 9: b'the', 10: b' at', 11: b'<|endoftext|>'}
+    # merges = [(b't', b'h'), (b' ', b'c'), (b' ', b'a'), (b'th', b'e'), (b' a', b't')]
+    # special_tokens = ["<|endoftext|>"]
+    # PAT = "|".join(map(re.escape, special_tokens))
+    # chunks = re.split(f"({PAT})", "the cat ate <|endoftext|><|endoftext|>")
+    # tokenizer = Tokenizer(vocab, merges)
+    # ids = tokenizer.optimized_encode("the cat ate <|endoftext|><|endoftext|>")
+    # decoded_str = tokenizer.decode(ids)
 
-    tokenizer.to_files("results")
+    # tokenizer.to_files("results")
 
-    a = Tokenizer.from_files("results/vocab.json", "results/merges.json")
+    # a = Tokenizer.from_files("results/vocab.json", "results/merges.json")
 
-    print(a.vocab, a.merges)
+    # print(a.vocab, a.merges)
+    pass
