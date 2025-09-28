@@ -1,9 +1,12 @@
 import os
 import time
 import multiprocessing
+import heapq
+import tqdm
 import regex as re
 from typing import BinaryIO
 from collections import Counter, defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 
 def process_chunk_worker(args):
     input_path, start, end, special_tokens = args
@@ -11,9 +14,13 @@ def process_chunk_worker(args):
         f.seek(start)
         chunk = f.read(end - start).decode("utf-8", errors="ignore")
         striped_chunk = strip_special_tokens(chunk, special_tokens)
-        pre_tokens = [pre_tokenization(docs) for docs in striped_chunk]
-
-        pre_tokens = dict(sum((Counter(d) for d in pre_tokens), Counter()))
+        pre_tokens = Counter()
+        for chunk in tqdm.tqdm(striped_chunk, desc=f"Processing sub-chunk of {start} to {end}"):
+            pre_tokens.update(pre_tokenization(chunk))
+        # pre_tokens = [pre_tokenization(docs) for docs in striped_chunk]
+        # print(f"Complete pre_tokens before construct counter")
+        # pre_tokens = dict(sum((Counter(d) for d in pre_tokens), Counter()))
+        # print(f"Completed from {start} to {end}.")
     return pre_tokens
 
 def train_bpe(
@@ -207,6 +214,160 @@ def init_byte_pair(pre_tokens: dict[tuple, int]) -> tuple[dict[tuple[bytes, byte
     
     return byte_pair, byte_pair_postions
 
+class HeapItem:
+    def __init__(self, frequency: int, byte_pair: tuple[bytes, bytes]) -> None:
+        self.frequency = frequency
+        self.byte_pair = byte_pair
+
+    def __lt__(self, other: "HeapItem"):
+        if self.frequency != other.frequency:
+            return self.frequency > other.frequency
+        return self.byte_pair > other.byte_pair
+
+def init_byte_pair_heapq(pre_tokens: dict[tuple, int]) -> tuple[dict[tuple[bytes, bytes], int], list[HeapItem], dict[tuple[bytes, bytes], set]]:
+    """
+    Maintain byte-pair order by max-heap. Reduce max() operation to O(1).
+    
+    Maintain byte_pair positions (mapping from byte pair to its occurred word) in a dict[tuple, set], 
+    reduce add/remove from this set to O(1)
+    """
+    byte_pair = defaultdict(int)
+    byte_pair_positions = defaultdict(set)
+
+    for token, freq in pre_tokens.items():
+        windows = zip(token, token[1:])
+        for window in windows:
+            byte_pair[window] += freq
+            byte_pair_positions[window].add(token)
+
+    # Construct a max heap
+    heap_byte_pair = [HeapItem(freq, item) for item, freq in byte_pair.items()]
+    heapq.heapify(heap_byte_pair)
+    
+    return byte_pair, heap_byte_pair, byte_pair_positions
+
+def optimized_merge_heapq(
+        pre_tokens: dict[tuple, int], 
+        byte_pairs: dict[tuple[bytes, bytes], int], 
+        heap_byte_pairs: list[HeapItem],
+        byte_pair_positions: dict[tuple[bytes, bytes], set]
+        ) -> tuple[dict[tuple, int], None | tuple[bytes, bytes], dict[tuple[bytes, bytes], int], list[HeapItem], dict[tuple[bytes, bytes], set]]:
+    """
+    Optimized the merging process by incremental updating and in-place update.
+    API change from merge_once, which not maintain the `byte_pairs` and `byte_pair_positions` and create from scratch every time.
+    """
+    # TODO: max need linear complexity.
+    max_heap_item = None
+    while heap_byte_pairs:
+        candidate_item = heapq.heappop(heap_byte_pairs)
+        # lazy deletion
+        if candidate_item.byte_pair not in byte_pairs:
+            # this item have merged
+            continue
+        if candidate_item.frequency != byte_pairs[candidate_item.byte_pair]:
+            # this item don't have a sync frequency with byte pairs dictionary
+            continue
+
+        max_heap_item = candidate_item
+        break
+    
+    if max_heap_item is None:
+        return pre_tokens, None, byte_pairs, heap_byte_pairs, byte_pair_positions
+
+    pair_to_merge = max_heap_item.byte_pair
+    positions = byte_pair_positions[pair_to_merge]
+
+    affected_pairs = set()
+
+    for token in list(positions): # is case of mutating in iterating
+        freq = pre_tokens.pop(token, 0)
+        if freq == 0:
+            continue
+
+        merged_token = merge_byte_pair(token, pair_to_merge)
+        # pre_tokens[merged_token] += freq
+        pre_tokens[merged_token] = pre_tokens.get(merged_token, 0) + freq
+
+        for w in zip(token, token[1:]):
+            # Update `byte_pairs` and `byte_pair_positions` but not `heap_byte_pairs`, 'cause its lazy deletion
+            byte_pairs[w] -= freq
+            byte_pair_positions[w].discard(token)
+            if byte_pairs[w] <= 0:
+                del byte_pairs[w]
+                if w in byte_pair_positions:
+                    del byte_pair_positions[w]           
+            
+            affected_pairs.add(w)
+
+        for w in zip(merged_token, merged_token[1:]):
+            byte_pairs[w] += freq
+            byte_pair_positions[w].add(merged_token)
+            affected_pairs.add(w)
+    
+    for pair in affected_pairs:
+        if pair in byte_pairs:
+            heapq.heappush(heap_byte_pairs, HeapItem(byte_pairs[pair], pair))
+
+    return pre_tokens, pair_to_merge, byte_pairs,heap_byte_pairs, byte_pair_positions
+
+def optimized_train_bpe_heap_parallel(
+    input_path: str | os.PathLike, 
+    vocab_size: int, 
+    special_tokens: list[str], 
+    num_processes: int = 4,
+) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
+    """
+    Given a path to an input text file, trains a (byte-level) BPE tokenizer.
+
+    Parallalize the process of pre-tokenzition.
+
+    Args: 
+        input_path (str | os.PathLike): Path to a text file with BPE tokenizer training data.
+        vocab_size (int): A positive integer that defines the maximum final vocabulary size (including the
+            initial byte vocabulary, vocabulary items produced from merging, and any special tokens)
+        special_tokens (list[str]): A list of strings to add to the vocabulary. These special tokens do not
+            otherwise affect BPE training.
+
+    Returns: 
+        vocab (dict[int, bytes]): The tokenizer vocabulary, a mapping from int (token ID in the vocabulary)
+            to bytes (token bytes).
+        merges (list[tuple[bytes, bytes]]): A list of BPE merges produced from training. Each list item
+            is a tuple of bytes (<token1>, <token2>), representing that <token1> was merged with
+            <token2>. The merges should be ordered by order of creation.
+    """
+    start_time = time.time()
+    # init vocab
+    vocab = {ids: bytes([ids]) for ids in range(256)} | \
+        {256 + ids: token.encode("utf-8") for ids, token in enumerate(special_tokens)}
+    curr_size = len(vocab)
+    merges = []
+
+    with open(input_path, "rb") as f:
+        boundaries = find_chunk_boundaries(f, num_processes, b"<|endoftext|>")
+
+    tasks = [(input_path, start, end, special_tokens) for start, end in zip(boundaries[:-1], boundaries[1:])]
+
+    pre_tokens = Counter()
+    with multiprocessing.Pool(num_processes) as pool:
+        results = pool.imap_unordered(process_chunk_worker, tasks)
+        # for counter in tqdm.tqdm(results, total=len(tasks), desc="Processing pre-tokenization"):
+        # pre_tokens.update(counter)
+        pre_tokens = sum(results, Counter())
+
+    pre_tokenization_end_time = time.time()
+    print("Pre-tokenization time: ", pre_tokenization_end_time - start_time)
+
+    byte_pairs, heap_byte_pairs, byte_pair_positions = init_byte_pair_heapq(pre_tokens)
+    # while curr_size < vocab_size:
+    for _ in tqdm.tqdm(range(vocab_size - curr_size)):
+        pre_tokens, pair_to_merge, byte_pairs, heap_byte_pairs, byte_pair_positions = optimized_merge_heapq(pre_tokens, byte_pairs, heap_byte_pairs, byte_pair_positions)
+        if pair_to_merge is not None:
+            vocab[len(vocab)] = b''.join(pair_to_merge) # b''.join(pair_to_merge) to merge tuple[bytes, bytes] to a bytes
+            merges.append(pair_to_merge)
+            # curr_size += 1
+    print("Merge time:", time.time() - pre_tokenization_end_time)
+    return vocab, merges
+
 def optimized_merge(
         pre_tokens: dict[tuple, int], 
         byte_pairs: dict[tuple[bytes, bytes], int], 
@@ -216,6 +377,7 @@ def optimized_merge(
     Optimized the merging process by incremental updating and in-place update.
     API change from merge_once, which not maintain the `byte_pairs` and `byte_pair_positions` and create from scratch every time.
     """
+    # TODO: max need linear complexity.
     max_val = max(byte_pairs.values())
     pair_to_merge = max([k for k, v in byte_pairs.items() if v == max_val])
     positions = set(byte_pair_positions[pair_to_merge])
@@ -346,10 +508,10 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
-if __name__ == "__main__":
-    input_path = "/workspace/guozuyu/lmfs/assignment1-basics/tests/fixtures/corpus.en"
+# if __name__ == "__main__":
+#     input_path = "/workspace/guozuyu/lmfs/assignment1-basics/data/TinyStoriesV2-GPT4-valid.txt"
 
-    start_time = time.time()
-    vocab, merges = optimized_train_bpe(input_path=input_path, vocab_size=500, special_tokens=["<|endoftext|>"])
-    end_time = time.time()
-    print(end_time - start_time)
+#     start_time = time.time()
+#     vocab, merges = optimized_train_bpe_heap_parallel(input_path=input_path, vocab_size=10000, special_tokens=["<|endoftext|>"])
+#     end_time = time.time()
+#     print(end_time - start_time)
