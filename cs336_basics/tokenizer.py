@@ -1,21 +1,22 @@
+from __future__ import annotations
 import os
 import json
 import base64
-import time
 import heapq
-
 import regex as re
 
 import numpy as np
 
 from typing import Iterable, Iterator
 from itertools import islice
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor
 
 class Tokenizer:
     def __init__(self, vocab: dict[int, bytes], merges: list[tuple[bytes, bytes]], special_tokens: list[str] | None = None):
         """
         Constructor of `Tokenizer`.
+        We can register special tokens in this contructor.
         
         Args: 
             vocab (dict[int, bytes])
@@ -27,7 +28,7 @@ class Tokenizer:
         self.merges = merges
         # maintain the `special_tokens` in the `Tokenizer` instance, in this variable, 
         # special_token is `str`, attention to the convertion between `bytes`
-        self.special_tokens = special_tokens if special_tokens is not None else ["<|endoftext|>"]
+        special_tokens = special_tokens if special_tokens is not None else ["<|endoftext|>"]
 
         original_vocab_size = len(vocab)
         if special_tokens is not None:
@@ -38,6 +39,8 @@ class Tokenizer:
             }
         
         self.reverse_vocab = {v: k for k, v in self.vocab.items()}
+
+        self.special_tokens = {token: self.reverse_vocab[token.encode("utf-8")] for token in special_tokens}
 
         self.merge_priority = {pair: i for i, pair in enumerate(self.merges)}
 
@@ -148,62 +151,215 @@ class Tokenizer:
 
         return tuple(merged_tokens)
 
-    def split_special_tokens(self, text, special_tokens):
+    def split_special_tokens(self, text: str, special_tokens: list[str]) -> list[str]:
         # in case of overlapping special tokens
         PAT = "|".join(map(re.escape, sorted(special_tokens, key=len, reverse=True)))
         chunks = re.split(f"({PAT})", text)
-
         return chunks
+    
+    def _encode_chunk(self, text_bytes: tuple[bytes, ...]) -> list[int]:
+        # return the token ids
+        # let's begin. first, convert all bytes to integers in range 0..255
+        # ids = list(text_bytes)
+        while len(text_bytes) >= 2:
+            stats = defaultdict(int)
+            for window in zip(text_bytes, text_bytes[1:]):
+                stats[window] += 1
+            
+            # find the pair with the lowest merge index
+            pair = min(stats, key=lambda p: self.merge_priority.get(p, float("inf")))
+            # subtle: if there are no more merges available, the key will
+            # result in an inf for every single pair, and the min will be
+            # just the first pair in the list, arbitrarily
+            # we can detect this terminating case by a membership check
+            if pair not in self.merges:
+                break # nothing else can be merged anymore
+            # otherwise let's merge the best pair (lowest merge index)
+            # idx = self.reverse_vocab[pair]
+            text_bytes = self.merge_byte_pair(text_bytes, pair)
+            # ids = list(text_bytes)
+            # ids = merge(ids, pair, idx)
+        ids = [self.reverse_vocab[tok] for tok in text_bytes]
+        return ids
+    
+    class _Node:
+        """
+        Dual-Linked-List Node, maintaining byte in a word, for supporting in-place mutating, i.e. merging.
+        """
+        __slots__ = ['value', 'prev', 'next', 'index', 'deleted']
+        
+        def __init__(self, value: bytes, index: int):
+            self.value: bytes = value # byte to merge, (a half of pair)
+            self.index: int = index # cause' node will be maintained in a list of node, `nodes`, using index to fast access
+            self.prev: Tokenizer._Node | None = None
+            self.next: Tokenizer._Node | None = None
+            # cause' node will be maintrained in a list, `nodes`, so will not automatically collected by garbage collection
+            self.deleted: bool = False # denote node is merged, is out of date
+    
+    class HeapItem:
+        """Maintain byte-pairs by Min-Heap, where priority is rank of merging."""
+        def __init__(self, priority, index, pair):
+            self.priority = priority # priority of merges
+            self.index = index # left of pair, index in `nodes`
+            self.pair = pair
+        
+        def __lt__(self, other: Tokenizer.HeapItem):
+            if self.priority != other.priority:
+                return self.priority < other.priority
+            if self.pair != other.pair:
+                return self.pair < other.pair
+            return self.index < other.index
 
-    #FIXME: Following implementation is false, 'cause `merges` is actually ordered, we should 
-    # merge byte pair by this order, not by the order of bytes in a pre_token
-    # def encode(self, text: str) -> list[int]:
-    #     """
-    #     Encode an input text into a sequence of token IDs.
+    def _encode_chunk_optimized(self, text_bytes: tuple[bytes, ...]) -> list[int]:
+        """
+        maintain byte pair by heap and update merged byte pair to a token in-place by dual-linked-list.
+        """
+        if not text_bytes:
+            return []
 
-    #     Args:
-    #         text (str): 
+        # 1: Initialize the dual linked list
+        nodes: list[Tokenizer._Node] = [Tokenizer._Node(value=b, index=i) for i, b in enumerate(text_bytes)]
+        if len(nodes) > 1:
+            for i in range(len(nodes) - 1):
+                nodes[i].next = nodes[i+1]
+                nodes[i+1].prev = nodes[i]
 
-    #     Returns:
-    #         target_ids (list[int]):
-    #     """
-    #     chunks = self.split_special_tokens(text, self.special_tokens)
+        # 2: Initialize the heap for byte pair and its priority
+        pq: list[Tokenizer.HeapItem] = []
 
-    #     # pre_tokens = Tokenizer.pre_tokenization(text)
-    #     pre_tokens = []
-    #     for chunk in chunks:
-    #         # don't pre-tokenization the special tokens
-    #         if chunk in self.special_tokens:
-    #             pre_tokens.extend([chunk])
-    #         else:
-    #             pre_tokens.extend(Tokenizer.pre_tokenization(chunk))
+        for i in range(len(nodes) - 1):
+            left, right = nodes[i], nodes[i+1]
+            pair = (left.value, right.value)
+            
+            priority = self.merge_priority.get(pair, float("inf"))
+            
+            if priority != float("inf"):
+                heapq.heappush(pq, Tokenizer.HeapItem(priority, i, pair))
 
-    #     target_ids = []
-    #     for token in pre_tokens:
-    #         # encode special tokens
-    #         if token in self.special_tokens:
-    #             target_ids.extend([self.reverse_vocab[token.encode("utf-8")]])
-    #             continue
+        # 3: Merge a pair
+        while pq:
+            candidate_item = heapq.heappop(pq)
+            
+            left = nodes[candidate_item.index]
+            
+            # check effectiveness
+            if left.deleted:
+                continue
+            right = left.next
+            if right is None or right.deleted:
+                continue
+            if (left.value, right.value) != candidate_item.pair:
+                continue
 
-    #         idx, length = 0, len(token)
-    #         # while idx < length - 1:
-    #         #     if token[idx] + token[idx+1] in self.vocab.values():
-    #         #         token = Tokenizer.merge_byte_pair(token, (token[idx], token[idx+1]))
-    #         #         length -= 1
-    #         #         if idx > 0:
-    #         #             # backward 1 step to check if they can merge
-    #         #             # idx -= 1
-    #         #             idx = 0
-    #         #     else:
-    #         #         idx += 1
-    #         # Appling the merge rules learned ```in order``` on the splits
-    #         windows = list(zip(token, token[1:]))
-    #         for merge in self.merges:
-    #             if merge in windows:
-    #                 token = Tokenizer.merge_byte_pair(token, merge)
+            left.deleted = True
+            right.deleted = True
+            
+            # merge
+            new_val = candidate_item.pair[0] + candidate_item.pair[1]
 
-    #         target_ids.extend([self.reverse_vocab[t] for t in token])
-    #     return target_ids
+            # create a new node in dual-linked-list
+            new_node = Tokenizer._Node(value=new_val, index=candidate_item.index)
+            nodes[candidate_item.index] = new_node  # 
+            
+            new_node.prev = left.prev
+            new_node.next = right.next
+            if new_node.prev:
+                new_node.prev.next = new_node
+            if new_node.next:
+                new_node.next.prev = new_node
+
+            # --- add new byte pair to heap ---
+            
+            # left-side
+            if new_node.prev:
+                prev_node = new_node.prev
+                left_pair = (prev_node.value, new_node.value)
+                left_priority = self.merge_priority.get(left_pair, float("inf"))
+                if left_priority != float("inf"):
+                    heapq.heappush(pq, Tokenizer.HeapItem(left_priority, prev_node.index, left_pair))
+            
+            # right-side
+            if new_node.next:
+                next_node = new_node.next
+                right_pair = (new_node.value, next_node.value)
+                right_priority = self.merge_priority.get(right_pair, float("inf"))
+                if right_priority != float("inf"):
+                    heapq.heappush(pq, Tokenizer.HeapItem(right_priority, new_node.index, right_pair))
+
+        # 5. convert dual-linked-list back to list, collect all bytes
+        head = None
+        for node in nodes:
+            if not node.deleted and node.prev is None:
+                head = node
+                break
+        if head is None:
+            for node in nodes:
+                if not node.deleted:
+                    head = node
+                    break
+            if head is None:
+                 return []
+                 
+        final_bytes: list[bytes] = []
+        curr = head
+        while curr:
+            final_bytes.append(curr.value)
+            curr = curr.next
+
+        ids = [self.reverse_vocab[tok] for tok in final_bytes]
+        return ids
+    
+    def encode_ordinary(self, text: str):
+        """Encoding that ignore any special tokens. """
+        # split text into chunks of text by categories defined in regex pattern, aka pre-tokenization
+        text_chunks = Tokenizer.pre_tokenization(text)
+        ids = []
+        for chunk in text_chunks:
+            chunk_ids = self._encode_chunk_optimized(chunk)
+            ids.extend(chunk_ids)
+        return ids
+    
+    def encode(self, text, allowed_special="all"):
+        """
+        Unlike encode_ordinary, this function handles special tokens.
+        allowed_special: can be "all"|"none"|"none_raise" or a custom set of special tokens
+        if none_raise, then an error is raised if any special token is encountered in text
+        this is the default tiktoken behavior right now as well
+        any other behavior is either annoying, or a major footgun
+        """
+        # decode the user desire w.r.t. handling of special tokens
+        special = None
+        if allowed_special == "all":
+            special = self.special_tokens
+        elif allowed_special == "none":
+            special = {}
+        elif allowed_special == "none_raise":
+            special = {}
+            assert all(token not in text for token in self.special_tokens)
+        elif isinstance(allowed_special, set):
+            special = {k: v for k, v in self.special_tokens.items() if k in allowed_special}
+        else:
+            raise ValueError(f"allowed_special={allowed_special} not understood")
+        if not special:
+            # shortcut: if no special tokens, just use the ordinary encoding
+            return self.encode_ordinary(text)
+        # otherwise, we have to be careful with potential special tokens in text
+        # we handle special tokens by splitting the text
+        # based on the occurrence of any exact match with any of the special tokens
+        # we can use re.split for this. note that surrounding the pattern with ()
+        # makes it into a capturing group, so the special tokens will be included
+        special_chunks = self.split_special_tokens(text, list(self.special_tokens.keys()))
+        # now all the special characters are separated from the rest of the text
+        # all chunks of text are encoded separately, then results are joined
+        ids = []
+        for part in special_chunks:
+            if part in special:
+                # this is a special token, encode it separately as a special case
+                ids.append(special[part])
+            else:
+                # this is an ordinary sequence, encode it normally
+                ids.extend(self.encode_ordinary(part))
+        return ids
 
     def deoptimized_encode(self, text: str) -> list[int]:
         """
@@ -221,7 +377,7 @@ class Tokenizer:
         Returns:
             target_ids (list[int]):
         """
-        chunks = self.split_special_tokens(text, self.special_tokens)
+        chunks = self.split_special_tokens(text, list(self.special_tokens.keys()))
 
         pre_tokens = []
         for chunk in chunks:
@@ -240,16 +396,6 @@ class Tokenizer:
                     tokenized.append(token)
                     continue
                 
-                #FIXME: The commentted implementation is buggy. 
-                # When merge a byte pair in a pre_token, this pair could occur not single one time in the pre_token
-                # So we should substract the counts of the occurrence of this pair, not only 1, or it could throw out-of-index. 
-                # idx, length = 0, len(token)
-                # while idx < length - 1:
-                #     if (token[idx], token[idx+1]) == merge:
-                #         token = Tokenizer.merge_byte_pair(token, merge) # merge all byte pairs in the token
-                #         length -= 1 # length substract 1???
-                #     else: 
-                #         idx += 1
                 idx = 0
                 while idx < len(token) - 1:
                     if (token[idx], token[idx+1]) == merge:
@@ -270,9 +416,9 @@ class Tokenizer:
         
         return target_ids
     
-    def encode(self, text: str):
+    def encode_heap(self, text: str):
         """Maintain a priority-heap."""
-        chunks = self.split_special_tokens(text, self.special_tokens)
+        chunks = self.split_special_tokens(text, list(self.special_tokens.keys()))
 
         pre_tokens = []
         for chunk in chunks:
@@ -374,21 +520,3 @@ def batched(iterable, n, *, strict=False):
         if strict and len(batch) != n:
             raise ValueError('batched(): incomplete batch')
         yield batch
-
-
-if __name__ == "__main__":
-    # vocab = {0: b' ', 1: b'a', 2: b'c', 3: b'e', 4: b'h', 5: b't', 6: b'th', 7: b' c', 8: b' a', 9: b'the', 10: b' at', 11: b'<|endoftext|>'}
-    # merges = [(b't', b'h'), (b' ', b'c'), (b' ', b'a'), (b'th', b'e'), (b' a', b't')]
-    # special_tokens = ["<|endoftext|>"]
-    # PAT = "|".join(map(re.escape, special_tokens))
-    # chunks = re.split(f"({PAT})", "the cat ate <|endoftext|><|endoftext|>")
-    # tokenizer = Tokenizer(vocab, merges)
-    # ids = tokenizer.optimized_encode("the cat ate <|endoftext|><|endoftext|>")
-    # decoded_str = tokenizer.decode(ids)
-
-    # tokenizer.to_files("results")
-
-    # a = Tokenizer.from_files("results/vocab.json", "results/merges.json")
-
-    # print(a.vocab, a.merges)
-    pass
