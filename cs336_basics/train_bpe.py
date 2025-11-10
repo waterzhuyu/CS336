@@ -1,3 +1,4 @@
+from __future__ import annotations
 import os
 import time
 import multiprocessing
@@ -17,10 +18,7 @@ def process_chunk_worker(args):
         pre_tokens = Counter()
         for chunk in tqdm.tqdm(striped_chunk, desc=f"Processing sub-chunk of {start} to {end}"):
             pre_tokens.update(pre_tokenization(chunk))
-        # pre_tokens = [pre_tokenization(docs) for docs in striped_chunk]
-        # print(f"Complete pre_tokens before construct counter")
-        # pre_tokens = dict(sum((Counter(d) for d in pre_tokens), Counter()))
-        # print(f"Completed from {start} to {end}.")
+
     return pre_tokens
 
 def train_bpe(
@@ -57,6 +55,7 @@ def train_bpe(
 
         pre_tokens = [pre_tokenization(docs) for docs in striped_content]
         # combine pre_tokens from different docs, sum their counts
+        # `pre_tokens` is the basic unit to construct byte pairs that for merging
         pre_tokens = dict(sum((Counter(d) for d in pre_tokens), Counter()))
 
         while curr_size < vocab_size:
@@ -215,11 +214,13 @@ def init_byte_pair(pre_tokens: dict[tuple, int]) -> tuple[dict[tuple[bytes, byte
     return byte_pair, byte_pair_postions
 
 class HeapItem:
+    """Implment max-heap for identifing the most frequent byte pair."""
     def __init__(self, frequency: int, byte_pair: tuple[bytes, bytes]) -> None:
         self.frequency = frequency
         self.byte_pair = byte_pair
 
-    def __lt__(self, other: "HeapItem"):
+    def __lt__(self, other: HeapItem):
+        """The more frequent and bigger lexicographical ordered byte pair get bigger priority. """
         if self.frequency != other.frequency:
             return self.frequency > other.frequency
         return self.byte_pair > other.byte_pair
@@ -253,10 +254,8 @@ def optimized_merge_heapq(
         byte_pair_positions: dict[tuple[bytes, bytes], set]
         ) -> tuple[dict[tuple, int], None | tuple[bytes, bytes], dict[tuple[bytes, bytes], int], list[HeapItem], dict[tuple[bytes, bytes], set]]:
     """
-    Optimized the merging process by incremental updating and in-place update.
-    API change from merge_once, which not maintain the `byte_pairs` and `byte_pair_positions` and create from scratch every time.
+    Optimized the merging process by incremental updating and in-place update and maintain a max-heap for quicker search the frequent byte pair.
     """
-    # TODO: max need linear complexity.
     max_heap_item = None
     while heap_byte_pairs:
         candidate_item = heapq.heappop(heap_byte_pairs)
@@ -285,7 +284,6 @@ def optimized_merge_heapq(
             continue
 
         merged_token = merge_byte_pair(token, pair_to_merge)
-        # pre_tokens[merged_token] += freq
         pre_tokens[merged_token] = pre_tokens.get(merged_token, 0) + freq
 
         for w in zip(token, token[1:]):
@@ -314,7 +312,7 @@ def optimized_train_bpe_heap_parallel(
     input_path: str | os.PathLike, 
     vocab_size: int, 
     special_tokens: list[str], 
-    num_processes: int = 4,
+    num_processes: int = 16,
 ) -> tuple[dict[int, bytes], list[tuple[bytes, bytes]]]:
     """
     Given a path to an input text file, trains a (byte-level) BPE tokenizer.
@@ -508,10 +506,10 @@ def find_chunk_boundaries(
     # Make sure all boundaries are unique, but might be fewer than desired_num_chunks
     return sorted(set(chunk_boundaries))
 
-# if __name__ == "__main__":
-#     input_path = "/workspace/guozuyu/lmfs/assignment1-basics/data/TinyStoriesV2-GPT4-valid.txt"
+if __name__ == "__main__":
+    input_path = "/public/home/wangfei/user_home/gzy/proj/CS336/data/TinyStoriesV2-GPT4-train.txt"
 
-#     start_time = time.time()
-#     vocab, merges = optimized_train_bpe_heap_parallel(input_path=input_path, vocab_size=10000, special_tokens=["<|endoftext|>"])
-#     end_time = time.time()
-#     print(end_time - start_time)
+    start_time = time.time()
+    vocab, merges = optimized_train_bpe_heap_parallel(input_path=input_path, vocab_size=10000, special_tokens=["<|endoftext|>"])
+    end_time = time.time()
+    print(end_time - start_time)
