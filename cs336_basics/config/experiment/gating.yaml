@@ -8,3 +8,6 @@ model:
     ffn:
       _target_: cs336_basics.models.SiLU
       d_ff: 2048
+
+training:
+  save_path: "/public/home/wangfei/user_home/gzy/proj/CS336/results/ckpts/gating/model.bin"

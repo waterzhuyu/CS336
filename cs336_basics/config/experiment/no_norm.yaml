@@ -10,3 +10,6 @@ model:
   
   final_norm: 
     _target_: torch.nn.Identity
+
+training:
+  save_path: "/public/home/wangfei/user_home/gzy/proj/CS336/results/ckpts/no_norm/model.bin"

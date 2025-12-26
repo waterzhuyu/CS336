@@ -205,7 +205,7 @@ def hydra_train(
             }, step=i)
 
         if i % 1000 == 0:
-            save_checkpoint(model, optimizer, i, save_path)
+            save_checkpoint(model, optimizer, i, f"{save_path}-{i}")
     
     t1 = time.time()
     wandb.finish()

@@ -9,3 +9,6 @@ model:
       use_rope: false
 
       theta: null
+
+training:
+  save_path: "/public/home/wangfei/user_home/gzy/proj/CS336/results/ckpts/no_norm/model.bin"
