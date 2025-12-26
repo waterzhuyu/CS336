@@ -4,68 +4,65 @@ import numpy as np
 
 from itertools import islice
 
+import torch
+from tqdm import tqdm
+
 from cs336_basics.train_bpe import optimized_train_bpe_parallel, optimized_train_bpe_heap_parallel
 from cs336_basics.tokenizer import Tokenizer
-from cs336_basics.data import build_sharded_dataset_parallel
+from cs336_basics.data import build_sharded_dataset_parallel, get_batch
 
-if __name__ == "__main__":
-    # train_bpe_tinystories
-    # vocab_size 10,000
-    # input_path = f"/workspace/guozuyu/lmfs/assignment1-basics/data/TinyStoriesV2-GPT4-train.txt"
-    # input_path = f"/workspace/guozuyu/lmfs/assignment1-basics/data/try.txt"
-    input_path = f"/workspace/guozuyu/lmfs/assignment1-basics/data/owt_train.txt"
-    # start_time = time.time()
-    # vocab, merges = optimized_train_bpe_heap_parallel(input_path, vocab_size=32000, special_tokens=["<|endoftext|>"], num_processes=32)
+
+def main():
+    input_path = f"/public/home/wangfei/user_home/gzy/proj/CS336/data/owt_train.txt"
+    start_time = time.time()
+    vocab, merges = optimized_train_bpe_heap_parallel(input_path, vocab_size=32000, special_tokens=["<|endoftext|>"], num_processes=16)
     # print("vocab: ", vocab)
     # print("merges: ", merges)
-    # end_time = time.time()
-    # bpe_tokenizer = Tokenizer(vocab, merges)
-
-    tokenizer_output_path = f"/workspace/guozuyu/lmfs/assignment1-basics/results/owt-train"
-    # tokenizer_output_path = f"/workspace/guozuyu/lmfs/assignment1-basics/results/tinystories-train"
-    # vocab_path = os.path.join(tokenizer_output_path, "vocab.json")
-    # merges_path = os.path.join(tokenizer_output_path, "merges.json")
-
-    # bpe_tokenizer.to_files(tokenizer_output_path)
-
-    # print("Train time: ", end_time - start_time)
-
-    # tokenizer_output_path = f"/workspace/guozuyu/lmfs/assignment1-basics/results/tinystories"
-    vocab_path = os.path.join(tokenizer_output_path, "vocab.json")
-    merges_path = os.path.join(tokenizer_output_path, "merges.json")
-    bpe_tokenizer = Tokenizer.from_files(vocab_path, merges_path)
-
-    # encoded_output = f"/workspace/guozuyu/lmfs/assignment1-basics/data/TinyStoriesV2-GPT4-train.npy"
-    encoded_output = f"/workspace/guozuyu/lmfs/assignment1-basics/data/owt-train"
-    start_time = time.time()
-    idx_path = build_sharded_dataset_parallel(input_path, encoded_output, bpe_tokenizer.encode_shard)
     end_time = time.time()
-    print("encode time: ", end_time - start_time)
-    # with open(input_path, encoding="utf-8") as f, open(encoded_output, mode="ab") as out_f:
-    #     encode_start_time = time.time()
-    #     # f is a iterable, read it line-by-line
-    #     ids_iter = bpe_tokenizer.encode_iterable(f, batch_size=2048, num_workers=32)
+    bpe_tokenizer = Tokenizer(vocab, merges)
 
-    #     while True:
-    #         chunk = islice(ids_iter, 100000)
-    #         ids = np.fromiter(chunk, dtype=np.uint16)
-    #         if len(ids) == 0:
-    #             break
+    tokenizer_output_path = f"results/tokenizer/owt-train-32k"
+    bpe_tokenizer.to_files(tokenizer_output_path)
 
-    #         encoded_end_time = time.time()
-    #         # print(f"Encode time of {len(ids)} tokens: {encoded_end_time - encode_start_time}")       
-    #         ids.tofile(out_f)
-    #     encoded_end_time = time.time()
-    #     print(f"Encoded time: {encoded_end_time - encode_start_time}")
+    print(f"It takes {end_time - start_time}s to train tokenizer on tinystories.")
+
+# def encode(tokenizer_dir, data_path, output_dir):
+#     vocab_filepath = f"{tokenizer_dir}/vocab.json"
+#     merges_filepath = f"{tokenizer_dir}/merges.json"
+#     tokenizer = Tokenizer.from_files(vocab_filepath, merges_filepath)
+#     with open(data_path, "r") as f:
+#         ids_iter = tokenizer.encode_iterable(f)
+    
+#         output_path = f"{output_dir}/owt_valid.npy"
+#         np.save(output_path, np.fromiter(ids_iter, dtype=np.uint16))
 
 
-        # while (ids := np.fromiter(ids_iter, dtype=np.uint16, count=10000)).size > 0:
-        #     encode_end_time = time.time()
-        #     print("Encode time of 10000 tokens: ", encode_end_time - encode_start_time)
+def encode(tokenizer_dir, data_path, output_dir, total_lines):
+    vocab_filepath = f"{tokenizer_dir}/vocab.json"
+    merges_filepath = f"{tokenizer_dir}/merges.json"
+    tokenizer = Tokenizer.from_files(vocab_filepath, merges_filepath)
+    with open(data_path, "r") as f:
+        ids_iter = tokenizer.encode_iterable(f, total_lines)
+    
+        # output_path = f"{output_dir}/TinyStoriesV2-GPT4-valid.npy"
+        output_path = f"{output_dir}/tinystories_sample.npy"
+        # output_path = f"{output_dir}/owt_valid.npy"
+        np.save(output_path, np.fromiter(ids_iter, dtype=np.uint16))
 
-        #     ids.tofile(out_f)
+if __name__ == "__main__":
+    # tokenizer_dir = "results/tokenizer/owt-train-32k"
+    tokenizer_dir = "results/tokenizer/tinystories-train-10k"
+    # data_path = "data/owt_valid.txt"
+    # data_path = "data/TinyStoriesV2-GPT4-valid.txt"
+    data_path = "tests/fixtures/tinystories_sample.txt"
+    output_dir = "results/npy"
 
-    # encoded_output = f"/workspace/guozuyu/lmfs/assignment1-basics/data/owt.npy"
+    with open(data_path, "r", encoding="utf-8") as f:
+        total_lines = sum(1 for _ in f)
 
-    # train_bpe_expts_owt
-    # vocab_size 32,000
+    t0 = time.time()
+    encode(tokenizer_dir, data_path, output_dir, total_lines)
+    t1 = time.time()
+    t = t1 - t0
+    throughput = os.path.getsize(data_path) / (1024 * 1024) / t
+    print(f"encode cost time: {t}s, throughput approx {throughput} MB/s.")
