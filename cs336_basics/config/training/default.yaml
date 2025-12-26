@@ -1,0 +1,6 @@
+steps: 5000
+warmup_ratio: 0.14293953397618658
+val_steps: 20
+eval_interval: 100
+save_path: "/public/home/wangfei/user_home/gzy/proj/CS336/results/ckpts"
+max_norm: 1.0

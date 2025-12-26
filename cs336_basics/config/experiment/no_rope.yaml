@@ -1,0 +1,11 @@
+# @package _global_
+wandb: 
+  name: "ablation-no-rope"
+  tags: ["ablation", "rope", "baseline"]
+
+model: 
+  block:
+    attn:
+      use_rope: false
+
+      theta: null

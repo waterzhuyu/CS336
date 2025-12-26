@@ -1,0 +1,10 @@
+# @package _global_
+wandb:
+  name: "ablation-gating-ffn"
+  tags: ["ablation", "gating"]
+
+model:
+  block:
+    ffn:
+      _target_: cs336_basics.models.SiLU
+      d_ff: 2048

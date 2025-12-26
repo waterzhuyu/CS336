@@ -1,12 +1,15 @@
 import math
 
 import torch
+import hydra
 
 from torch import nn
 from torch import Tensor
 
+from typing import Any
 from jaxtyping import Float
 from einops import einsum, rearrange
+from omegaconf import DictConfig
 
 class Linear(nn.Module):
     def __init__(
@@ -42,7 +45,7 @@ class Embedding(nn.Module):
 
         p = torch.empty(num_embeddings, embedding_dim, dtype=dtype, device=device)
         # init to \mathcal{N}(0, 1), truncate to (-3, 3)
-        nn.init.trunc_normal_(p, mean=0, std=1, a=-3, b=-3)
+        nn.init.trunc_normal_(p, mean=0, std=1, a=-3, b=3)
 
         self.weight = nn.Parameter(p)
     
@@ -78,7 +81,7 @@ class RMSNorm(nn.Module):
         return result.to(in_dtype)
 
 def swish(x: Float[Tensor, "batch seq d_model"]) -> Float[Tensor, "batch seq d_model"]:
-    return x / (1 + torch.exp(-x))
+    return x * torch.sigmoid(x)
 
 class PositionWiseFFN(nn.Module):
     def __init__(
@@ -98,6 +101,22 @@ class PositionWiseFFN(nn.Module):
     def forward(self, x: Float[Tensor, "batch seq d_model"]) -> Float[Tensor, "batch seq d_model"]:
         """W2(SiLU(W1x) odot W2x)"""
         return self.w2(swish(self.w1(x)) * self.w3(x))
+
+class SiLU(nn.Module):
+    def __init__(
+        self,
+        d_model: int,
+        d_ff: int,
+        device: torch.device | None = None,
+        dtype: torch.dtype | None = None
+    ) -> None:
+        super().__init__()
+        self.w1 = Linear(d_model, d_ff, device, dtype)
+        self.w2 = Linear(d_ff, d_model, device, dtype)
+    
+    def forward(self, x: Float[Tensor, "batch seq d_model"]) -> Float[Tensor, "batch seq d_model"]:
+        return self.w2(swish(self.w1(x)))
+
 
 class RotaryPositionalEmbedding(nn.Module):
     def __init__(
@@ -228,7 +247,7 @@ class CausalMultiHeadAttention(nn.Module):
         keys = rearrange(K, "batch seq (head d_k) -> batch head seq d_k", head=self.num_heads)
         values = rearrange(V, "batch seq (head d_v) -> batch head seq d_v", head=self.num_heads)
 
-        mask = ~torch.triu(torch.ones(s, s, dtype=torch.bool), diagonal=1)
+        mask = ~torch.triu(torch.ones(s, s, dtype=torch.bool, device=x.device), diagonal=1)
         # mask = mask.unsqueeze(0).unsqueeze(0) # optional, because mask support broadcasting
 
         if self.use_rope:
@@ -278,7 +297,7 @@ class TransformerBlock(nn.Module):
         # self attn sublayer
         if self.attn.use_rope:
             if token_positions is None:
-                token_positions = torch.arange(0, s)
+                token_positions = torch.arange(0, s, device=x.device)
             x = x + self.attn(self.ln1(x), token_positions=token_positions)
         else:
             x = x + self.attn(self.ln1(x))
@@ -301,7 +320,7 @@ class TransformerLM(nn.Module):
         super().__init__()
 
         self.token_embeddings = Embedding(num_embeddings=vocab_size, embedding_dim=d_model)
-        self.layers = [
+        self.layers = nn.ModuleList([
             TransformerBlock(
                 d_model=d_model, 
                 num_heads=num_heads, 
@@ -311,7 +330,7 @@ class TransformerLM(nn.Module):
                 max_seq_len=context_length
             ) 
             for _ in range(num_layers)
-        ]
+        ])
         self.ln_final = RMSNorm(d_model=d_model)
         self.lm_head = Linear(in_features=d_model, out_features=vocab_size)
 
@@ -323,4 +342,91 @@ class TransformerLM(nn.Module):
             x = layer(x)
         x = self.ln_final(x)
 
+        return self.lm_head(x)
+
+def instantiate(config_or_obj: DictConfig | Any, **kwargs):
+    if isinstance(config_or_obj, DictConfig):
+        return hydra.utils.instantiate(config_or_obj, **kwargs)
+    
+    if isinstance(config_or_obj, type):
+        return config_or_obj(**kwargs)
+    return config_or_obj
+
+class ModularTransformerBlock(nn.Module):
+    def __init__(
+        self,
+        attn: DictConfig | nn.Module,
+        ffn: DictConfig | nn.Module,
+        norm: DictConfig | nn.Module,
+        pre_norm: bool = True,
+    ) -> None:
+        super().__init__()
+
+        self.pre_norm = pre_norm
+
+        self.attn = instantiate(attn)
+        self.ln1 = instantiate(norm)
+        self.ln2 = instantiate(norm)
+        self.ffn = instantiate(ffn)
+    
+    def forward(
+        self,
+        x: Float[Tensor, "batch seq d_model"],
+        token_positions: Float[Tensor, "... seq"] | None = None,
+    ) -> Float[Tensor, "batch seq d_model"]:
+        use_rope = getattr(self.attn, "use_rope", False)
+
+        if use_rope and token_positions is None:
+            b, s, _ = x.shape
+            token_positions = torch.arange(0, s, device=x.device)
+        
+        if self.pre_norm:
+            if use_rope: 
+                x = x + self.attn(self.ln1(x), token_positions=token_positions)
+            else: 
+                x = x + self.attn(self.ln1(x))
+        
+            x = x + self.ffn(self.ln2(x))
+        else: 
+            if use_rope:
+                x_out = self.attn(x, token_positions=token_positions)
+            else:
+                x_out = self.attn(x)
+            x = self.ln1(x_out + x)
+
+            x = self.ln2(self.ffn(x) + x)
+
+        return x
+
+class ModularTransformerLM(nn.Module):
+    def __init__(
+        self, 
+        num_layers: int,
+        embedding: DictConfig | nn.Module,
+        block: DictConfig | nn.Module,
+        final_norm: DictConfig | nn.Module, 
+        head: DictConfig | nn.Module,
+        **kwargs,
+    ) -> None:
+        super().__init__()
+
+        self.token_embeddings = instantiate(
+            embedding,
+        )
+
+        self.layers = nn.ModuleList([
+            instantiate(block)
+            for _ in range(num_layers)
+        ])
+
+        self.ln_final = instantiate(final_norm)
+
+        self.lm_head = instantiate(head)
+
+    def forward(self, x: Float[Tensor, "batch seq"]) -> Float[Tensor, "batch seq vocab_size"]:
+        x = self.token_embeddings(x)
+        for layer in self.layers:
+            x = layer(x)
+        
+        x = self.ln_final(x)
         return self.lm_head(x)

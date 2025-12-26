@@ -1,0 +1,11 @@
+# @package _global_
+wandb: 
+  name: "ablation-post-norm"
+  tags: ["ablation", "norm"]
+
+model: 
+  block:
+    pre_norm: false
+  
+  final_norm: 
+    _target_: torch.nn.Identity

@@ -1,0 +1,25 @@
+program: cs336_basics/scripts/main.py
+method: random
+metric:
+  name: losses/valid
+  goal: minimize
+
+parameters:
+  lr: 
+    distribution: log_uniform_values
+    min: 1e-4
+    max: 6e-3
+
+  weight_decay:
+    distribution: log_uniform_values
+    min: 0.005
+    max: 0.1
+
+  warmup_ratio:
+    distribution: uniform
+    min: 0.05
+    max: 0.15
+  
+early_terminate:
+  type: hyperband
+  min_iter: 1000

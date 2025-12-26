@@ -1,0 +1,6 @@
+train_path: "/public/home/wangfei/user_home/gzy/proj/CS336/results/npy/TinyStoriesV2-GPT4-train.npy"
+val_path: "/public/home/wangfei/user_home/gzy/proj/CS336/results/npy/TinyStoriesV2-GPT4-valid.npy"
+
+batch_size: 256
+vocab_size: 10000
+context_length: 256

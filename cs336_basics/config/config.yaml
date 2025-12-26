@@ -1,0 +1,13 @@
+defaults:
+  - _self_
+  - model: basic
+  - optimizer: adamw
+  - data: tinystories
+  - training: default
+
+seed: 42
+
+wandb: 
+  project: "cs336_basics"
+  name: ${model._target_}
+  tags: []

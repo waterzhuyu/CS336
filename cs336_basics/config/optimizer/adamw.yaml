@@ -1,0 +1,7 @@
+_target_:
+  cs336_basics.optimizer.AdamW
+
+lr: 0.005829523037212311
+weight_decay: 0.037226887574814384
+betas: [0.9, 0.999]
+eps: 1e-8
