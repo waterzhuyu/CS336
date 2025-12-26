@@ -4,6 +4,7 @@ import json
 import base64
 import heapq
 import regex as re
+from tqdm import tqdm
 
 import numpy as np
 
@@ -472,7 +473,7 @@ class Tokenizer:
 
         return target_ids
 
-    def encode_iterable(self, iterable: Iterable[str], batch_size: int = 256, num_workers = 8) -> Iterator[int]:
+    def encode_iterable(self, iterable: Iterable[str], total: int | None = None) -> Iterator[int]:
         """
         Given an iterable of strings (e.g., a Python file handle), return a generator that lazily yields token IDs. 
         This is required for memory-efficient tokenization of large files that we cannot directly load into
@@ -480,16 +481,8 @@ class Tokenizer:
 
         Using ThreadPoolExecutor to parallelize the encoding of one batch.
         """
-        with ThreadPoolExecutor(max_workers=num_workers) as executor:
-            # i = 1
-            # start = time.time()
-            for batch in batched(iterable, batch_size):
-                results = list(executor.map(self.encode, batch)) # return as submit order
-                for encoded in results:
-                    yield from encoded
-                # end = time.time()
-                # print(f"{i} batch yield: ", end - start)
-                # i += 1
+        for chunk in tqdm(iterable, total=total, desc="Tokenizing", unit="lines"):
+            yield from self.encode(chunk)
 
     def encode_shard(self, shard_id, lines, out_dir, batch_size, num_workers):
         """encode batch and write to numpy file"""
