@@ -28,7 +28,7 @@ def load_checkpoint(
         model: nn.Module, 
         optimizer: Optimizer
     ) -> int:
-    state = torch.load(src)
+    state = torch.load(src, weights_only=False)
 
     model.load_state_dict(state['model_state'])
     optimizer.load_state_dict(state['optimizer_state'])
